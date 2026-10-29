@@ -1,0 +1,261 @@
+# =============================================================================
+# dclean 配置：Part_Sorting_300 / walkerS2
+# =============================================================================
+#
+# 用法：
+#   cp configs/part_sorting.toml configs/my_dataset.toml
+#   # 修改 fps、关节维度、绝对阈值
+#   .venv/bin/dclean check --dataset <data> --out <out> \
+#       --config configs/my_dataset.toml
+#
+# 配置原则：
+#   1. 先跑全量检查，不要先拍阈值；
+#   2. 先看 trajectory_calibration.json / video_quality_calibration.json，
+#      再用该数据集自己的分布选阈值；
+#   3. 绝对阈值（step_abs_floor、trajectory_abs_floor 等）和关节单位有关，
+#      换机器人/换单位必须重设；
+#   4. 不要把 Part_Sorting_300 的阈值直接套到其他数据集。
+#
+# 本配置的单位约定：
+#   - action/state 的关节量：rad（如果是米/归一化量，绝对阈值要改）；
+#   - 时间：秒；
+#   - 视频亮度：0-255 灰度；
+#   - 帧数：帧。
+# =============================================================================
+
+
+[fps]
+# 数据集名义采样率，必须等于 meta/info.json 的 fps。
+# 用途：
+#   - 动作 timestamp 的期望 dt = 1/fps；
+#   - 帧号 <-> 秒的换算；
+#   - 视频段 (to-from)*fps ≈ length 的检查。
+# 30 fps 的数据不要写成 60；29.97 的数据写 29.97。
+expected = 30.0
+
+
+[l1]
+# 动作 timestamp 与 1/fps 的绝对容差，单位秒。
+# float32 timestamp 的正常抖动约 1e-6 s；1e-4 s 足够宽松，
+# 又能抓住“缺一帧（约 0.033 s）”这种明显问题。
+# 如果数据时间戳抖动更大（例如某些控制器时间戳只有毫秒精度），
+# 可以适当增大到 1e-3；不要大到无法区分缺帧。
+dt_abs_tol_s = 1e-4
+
+# 缺帧/gap 的容忍程度。
+# 程序里的 gap 阈值 = (1 + 0.5 * max(1, max_gap_frames)) / fps。
+#   max_gap_frames = 1 -> dt > 1.5/fps 报 gap（默认）
+#   max_gap_frames = 2 -> dt > 2.0/fps 报 gap
+# 数值越大越宽松；0 也按 1 处理。
+max_gap_frames = 1
+
+
+[l2]
+# -----------------------------------------------------------------------------
+# 连续关节范围（inclusive）
+# -----------------------------------------------------------------------------
+# action/state 中参与连续数值检查的维度。
+# walkerS2：0-17 是左右臂关节 + 手指；18/19 是离散夹爪。
+# 换机器人时先看 info.json 的 features.action.names / observation.state.names，
+# 把这里改成连续关节的范围。
+joint_dims = [0, 17]
+
+# 离散维度（当前 walkerS2 的夹爪 18/19）。
+# 它们不参与连续 step/residual/trajectory 计算，避免把 ±1 切换
+# 误判成巨大关节跳变。当前检查直接使用 joint_dims 的连续范围；
+# 这里保留为语义说明，便于自定义脚本或后续扩展。
+discrete_dims = [18, 19]
+
+# -----------------------------------------------------------------------------
+# 恒定通道
+# -----------------------------------------------------------------------------
+# 单集内某维 std <= 该值，视为“该集恒定”。
+# 1e-6 很严格：只有几乎完全不变才算恒定；
+# 调大（如 1e-5）会更积极地报“冻结关节”，但也更容易误报。
+constant_std_eps = 1e-6
+
+# 某维在至少这个比例的 episode 中都恒定，视为“数据集全局恒定”。
+# 0.95 表示 95% 的集都恒定才报数据集级 info；
+# 全局恒定只报 info，不会把每一集都标成 warn。
+# 当前数据：dim14（L_finger1）、dim18（left_gripper）是全局恒定。
+constant_global_fraction = 0.95
+
+# -----------------------------------------------------------------------------
+# 瞬时冲击（joint step）
+# -----------------------------------------------------------------------------
+# 逐时间步计算 Δ = x[t+1] - x[t]，先对所有 episode 汇总该维的
+# median 和 MAD，再算稳健 z：
+#   scale = max(1.4826 * MAD, step_scale_floor)
+#   z = |Δ - median| / scale
+#
+# step_scale_floor 是 scale 的下限，防止近静止关节 MAD=0 时 z 爆炸。
+# 太小：量化噪声会产生巨大 z；太大：降低对真实跳变的敏感度。
+step_scale_floor = 0.01
+
+# 绝对步长下限，单位与 action 相同（当前是 rad）。
+# 只有 |Δ| > step_abs_floor 且 z > step_z 才报。
+# 0.1 rad/帧 @30fps ≈ 3 rad/s，属于明显快速动作；
+# 如果机器人更慢/更快，按实际关节速度调整。
+step_abs_floor = 0.1
+
+# 稳健 z 阈值。默认 6，越大越保守。
+step_z = 6.0
+
+# 单集被标记的 step 事件数 >= 该值时判 fail，否则 warn。
+# 当前数据正常快速段约 10-40 个事件，所以 50 作为 fail 边界。
+step_fail_count = 50
+
+# -----------------------------------------------------------------------------
+# action vs state 同帧残差
+# -----------------------------------------------------------------------------
+# 只比较 dims 0-17；夹爪 18/19 在 action/state 中完全相等，排除。
+# residual = |action[t] - state[t]|；
+# p99 > action_state_p99_warn 或 max > action_state_max_warn -> warn。
+# 单位同 action。当前数据同帧残差均值约 3e-4。
+action_state_p99_warn = 0.02
+action_state_max_warn = 0.1
+
+# 输出 detail 时，列出 residual 超过该值的帧范围。
+action_state_frame_tol = 0.05
+
+# -----------------------------------------------------------------------------
+# 轨迹偏移离群（重点）
+# -----------------------------------------------------------------------------
+# 参与轨迹比较的维度；建议与 joint_dims 一致。
+# 算法：
+#   median[t,j] = 所有 episode 在帧 t、维 j 的中位数
+#   MAD[t,j]    = median(|x - median|)
+#   scale       = max(1.4826*MAD, trajectory_scale_floor)
+#   z           = |x - median| / scale
+#   score[t]    = sqrt(mean_j z^2)
+# 然后对 score 做滑动平均，找持续偏高的段。
+trajectory_dims = [0, 17]
+
+# 至少要有这么多“长度相同且 action 有限”的 episode 才计算轨迹基线。
+# 少于该数量时输出 info 级 l2.trajectory_not_computed，不强行算。
+# 小数据集可以调小，但中位数/MAD 会不稳定。
+trajectory_min_episodes = 10
+
+# 平滑窗口，单位帧。15 帧 @30fps = 0.5 s。
+# 越大越保守、越不容易被单帧毛刺触发，但短事件也可能被抹掉。
+trajectory_smooth_frames = 15
+
+# 连续异常段的最小长度，单位帧。
+# 15 帧 @30fps = 0.5 s；小于该长度的段不报。
+trajectory_min_segment_frames = 15
+
+# 合并两个异常段之间允许的最大间隔，单位帧。
+# 例如异常段中间掉了 3 帧再继续，仍算同一段；5 表示允许 5 帧间隔。
+trajectory_merge_gap_frames = 5
+
+# 轨迹 z 的 scale 下限。近静止阶段 MAD 可能接近 0，
+# 不加下限会把 1e-6 的噪声算成巨大 z。
+trajectory_scale_floor = 0.01
+
+# 平滑 score 超过该值才进入候选段。
+# 当前 Part_Sorting_300：正常集最高 8.72，异常集最低 31.66，
+# 10 落在空档里。换数据集必须看 trajectory_calibration.json 重新选。
+trajectory_z_warn = 10.0
+
+# 平滑 score 超过该值判 fail，否则 warn。
+# 当前 9 个异常集 score 31.7-34.6，因此会判 fail。
+# 如果希望只提示不判 fail，把它调到 40 或更高。
+trajectory_z_fail = 20.0
+
+# 段内最大绝对偏移下限，单位 action（当前 rad）。
+# 只有 score 高且物理偏移也足够大才报，避免低方差维度的微小抖动。
+trajectory_abs_floor = 0.2
+
+# 段内最大绝对偏移超过该值直接判 fail，单位 action。
+# 当前异常集最大偏移 1.55-1.82 rad。
+trajectory_abs_fail = 1.0
+
+
+[l3]
+# codec 声明不一致时的严重度：info / warn / fail。
+# 当前数据部分 AV1 文件声明为 h264；这是元数据问题，
+# 文件本身可读，所以默认 info。
+codec_mismatch_status = "info"
+
+# 视频 nb_frames 与预期帧数的容差，单位帧。
+# 1 表示允许 1 帧误差；超过则报 l1.video_frame_count。
+frame_count_tol = 1
+
+
+[av_sync]
+# 是否执行“动作 timestamp vs MP4 packet PTS”逐帧对齐检查。
+# 只读，不修改数据；--no-video 会整体跳过。
+enabled = true
+
+# 最大漂移超过多少帧判 fail。
+# 1.0 表示允许 1 帧以内的 PTS/动作时间差；超过则 fail。
+tol_frames = 1.0
+
+# 最大漂移超过多少帧判 warn（但不超过 tol_frames 时为 warn）。
+warn_frames = 0.5
+
+# PTS 间隔相对 1/video_fps 的最大偏差，单位帧。
+# 用于发现 VFR/丢帧；超过 0.5 帧会 warn。
+pts_gap_tol_frames = 0.5
+
+
+[video_quality]
+# 是否执行视频画面质量检查。
+enabled = true
+
+# true：每一帧都检查（时间上不抽样），默认。
+# false：按 sample_fps 做时间抽样，速度快但可能漏掉短事件。
+full_frame = true
+
+# 仅当 full_frame=false 时生效，单位 fps。
+# 5.0 表示每秒取 5 帧；最小事件持续时间仍按秒换算成样本数。
+sample_fps = 5.0
+
+# 画面缩放到该尺寸后转灰度再算指标。
+# 160x120 是速度/灵敏度折中；调大更敏感但更慢。
+width = 160
+height = 120
+
+# 黑帧：平均亮度 < black_luma 且标准差 < black_std。
+# 亮度范围 0-255。黑帧/暗帧同时看均值和方差，避免把正常暗场景误判。
+black_luma = 20.0
+black_std = 5.0
+
+# 暗帧：平均亮度 < dark_luma 且标准差 < black_std，排除黑帧。
+# 当前正常画面亮度约 140-166；20/40 是黑帧/暗帧边界。
+dark_luma = 40.0
+
+# 过曝：亮度 > bright_luma 的像素比例 > bright_fraction。
+# 245/0.5 表示一半以上像素接近纯白。
+bright_luma = 245.0
+bright_fraction = 0.5
+
+# 冻结：相邻帧平均绝对差 < freeze_diff，持续 freeze_min_duration_s。
+# freeze_diff 单位是灰度级差（0-255）；0.5 很严格，只抓几乎完全相同的帧。
+# 静止场景会误报，所以冻结只报 warn。
+freeze_diff = 0.5
+freeze_min_duration_s = 0.8
+
+# 黑帧/暗帧/过曝事件的最短持续时间，单位秒。
+event_min_duration_s = 0.3
+
+# 模糊：blur_score < 该相机 blur 中位数 × blur_ratio_threshold，
+# 且 std >= blur_min_texture_std、不是冻结帧，持续 blur_min_duration_s。
+# Laplacian 方差对内容和相机很敏感，所以用“相对该相机中位数”的阈值，
+# 而不是全局绝对值。0.5 表示低于该相机中位数的一半才报。
+blur_ratio_threshold = 0.5
+
+# 纹理下限：std < 该值的帧视为平坦/无纹理，不参与模糊判断，
+# 避免把白墙/纯色桌面当成失焦。
+blur_min_texture_std = 10.0
+
+# 模糊事件最短持续时间，单位秒。
+blur_min_duration_s = 0.5
+
+
+[output]
+# summary.md 每个类别最多展示多少个 episode 行；完整列表在 CSV。
+summary_max_episodes = 50
+
+# issue detail 中最多列几个示例帧。
+max_examples_in_detail = 3
