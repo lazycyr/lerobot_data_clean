@@ -8,7 +8,6 @@
 
 ![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
 ![LeRobot](https://img.shields.io/badge/LeRobot-v3.0-green)
-![Tests](https://img.shields.io/badge/tests-48%20passed-brightgreen)
 
 [快速开始](#快速开始) · [检测能力](#检测能力) · [数据清洗](#数据清洗) · [详细检测原理](README_DETECTION.md)
 
