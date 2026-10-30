@@ -1,10 +1,13 @@
 """Trajectory-level deviation detection and threshold calibration.
 
 Each episode's action trajectory is compared with the dataset-wide median
-trajectory per frame and dimension. The per-frame deviation is robustly
-standardized (median/MAD), aggregated across continuous dimensions, smoothed,
-and scanned for sustained runs. This catches "this episode takes a different
-path for a while", as opposed to the instantaneous joint-step check.
+trajectory per frame and dimension. Episodes of different lengths are compared
+on the common frame axis with NaN padding: each episode is scored only over its
+own frames, and frames with too few episodes are skipped. The per-frame
+deviation is robustly standardized (median/MAD), aggregated across continuous
+dimensions, smoothed, and scanned for sustained runs. This catches "this
+episode takes a different path for a while", as opposed to the instantaneous
+joint-step check.
 
 The detector also returns per-episode metrics for every episode, including
 clean ones, so a new dataset can be calibrated from its own score distribution
@@ -54,20 +57,29 @@ def _dim_name(info: dict, feature: str, index: int) -> str:
     return f"dim_{index}"
 
 
-def _moving_average_rows(values: np.ndarray, window: int) -> np.ndarray:
-    """Moving average along axis 1 with edge padding; odd window."""
+def _moving_average_rows(
+    values: np.ndarray,
+    lengths: list[int],
+    window: int,
+) -> np.ndarray:
+    """Moving average along axis 1, only over each row's valid prefix.
+
+    Rows are NaN-padded to a common length; the padded tail stays NaN so it
+    cannot contribute to runs or argmax. Edge padding is used at both ends.
+    """
     if window <= 1:
         return values.copy()
     if window % 2 == 0:
         window += 1
     pad = window // 2
-    padded = np.pad(values, ((0, 0), (pad, pad)), mode="edge")
     kernel = np.ones(window, dtype=np.float64) / window
-    return np.apply_along_axis(
-        lambda row: np.convolve(row, kernel, mode="valid"),
-        axis=1,
-        arr=padded,
-    )
+    out = np.full_like(values, np.nan)
+    for row, length in enumerate(lengths):
+        if length <= 0:
+            continue
+        padded = np.pad(values[row, :length], (pad, pad), mode="edge")
+        out[row, :length] = np.convolve(padded, kernel, mode="valid")
+    return out
 
 
 def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
@@ -185,7 +197,7 @@ def check_trajectory_deviation(
     }
     if len(usable) < cfg.trajectory_min_episodes:
         reason = (
-            f"need at least {cfg.trajectory_min_episodes} finite episodes with equal length; "
+            f"need at least {cfg.trajectory_min_episodes} finite episodes; "
             f"got {len(usable)}"
         )
         metrics = [
@@ -198,22 +210,9 @@ def check_trajectory_deviation(
             metrics=metrics,
         )
 
-    lengths = {arrays.num_rows for arrays in usable.values()}
-    if len(lengths) != 1:
-        shown = sorted(lengths)[:5]
-        reason = (
-            f"variable episode lengths {shown}; trajectory check currently requires equal lengths"
-        )
-        metrics = [
-            TrajectoryEpisodeMetric(episode, False, note=reason)
-            for episode in all_episode_ids
-        ]
-        return TrajectoryResult(
-            issues=issues,
-            dataset_issue=dataset_issue("l2.trajectory_not_computed", "info", reason),
-            metrics=metrics,
-        )
-    length = lengths.pop()
+    episode_ids = sorted(usable)
+    lengths = [usable[ep].num_rows for ep in episode_ids]
+    max_length = max(lengths)
 
     lo, hi = cfg.trajectory_dims
     max_dim = min(arrays.action.shape[1] for arrays in usable.values()) - 1
@@ -231,21 +230,34 @@ def check_trajectory_deviation(
         )
     dims = list(range(lo, hi + 1))
 
-    episode_ids = sorted(usable)
-    stacked = np.stack([usable[ep].action[:, dims] for ep in episode_ids], axis=0)
-    median = np.median(stacked, axis=0)
-    mad = np.median(np.abs(stacked - median), axis=0)
+    # NaN-pad to the longest episode so unequal lengths share one baseline.
+    stacked = np.full((len(episode_ids), max_length, len(dims)), np.nan)
+    for row, ep in enumerate(episode_ids):
+        stacked[row, : lengths[row]] = usable[ep].action[:, dims]
+
+    median = np.nanmedian(stacked, axis=0)
+    mad = np.nanmedian(np.abs(stacked - median), axis=0)
     scale = np.maximum(1.4826 * mad, cfg.trajectory_scale_floor)
+    # Skip frames where too few episodes are alive to form a stable baseline.
+    valid_per_frame = np.isfinite(stacked[:, :, 0]).sum(axis=0)
+    enough = valid_per_frame >= cfg.trajectory_min_episodes
+    median[~enough] = np.nan
+    scale[~enough] = np.nan
+
     z = np.abs(stacked - median) / scale
-    score = np.sqrt(np.mean(z * z, axis=2))
-    smoothed = _moving_average_rows(score, cfg.trajectory_smooth_frames)
+    finite = np.isfinite(z)
+    z2_sum = np.where(finite, z * z, 0.0).sum(axis=2)
+    z_count = finite.sum(axis=2)
+    score = np.sqrt(z2_sum / np.maximum(z_count, 1))
+    score[z_count == 0] = np.nan
+    smoothed = _moving_average_rows(score, lengths, cfg.trajectory_smooth_frames)
     abs_residual_all = np.abs(stacked - median)
 
     metrics_by_episode: dict[int, TrajectoryEpisodeMetric] = {}
     flagged = 0
     for row, episode in enumerate(episode_ids):
         segment_scores = smoothed[row]
-        rel_score_frame = int(np.argmax(segment_scores))
+        rel_score_frame = int(np.nanargmax(segment_scores))
         max_smoothed_score = float(segment_scores[rel_score_frame])
 
         flat_all = int(np.nanargmax(abs_residual_all[row]))
@@ -350,7 +362,8 @@ def check_trajectory_deviation(
     baseline = dataset_issue(
         "l2.trajectory_baseline",
         "info",
-        f"median action trajectory over {len(usable)} episodes x {length} frames, "
+        f"median action trajectory over {len(usable)} episodes "
+        f"(lengths {min(lengths)}-{max_length}, NaN-padded), "
         f"dims {lo}-{hi}; {flagged} episode(s) exceed the deviation threshold",
     )
     return TrajectoryResult(issues=issues, dataset_issue=baseline, metrics=metrics)
